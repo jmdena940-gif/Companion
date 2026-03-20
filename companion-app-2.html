@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Companion</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #1a1510; color: #e8dfc8; font-family: Georgia, serif; min-height: 100vh; }
+@keyframes breathe { 0%,100%{opacity:0.2;transform:scale(0.8)} 50%{opacity:1;transform:scale(1.2)} }
+@keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-thumb { background: #4a3d2e; border-radius: 2px; }
+textarea, input, button { font-family: Georgia, serif; }
+.message { animation: fadeIn 0.3s ease forwards; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+// ============================================================
+// CONFIGURATION — entered via settings screen in app
+// ============================================================
+const SUPABASE_URL = "https://hafgafdschvumtkvxutl.supabase.co";
+let ANTHROPIC_KEY = localStorage.getItem('companion_anthropic_key') || '';
+let SUPABASE_ANON_KEY = localStorage.getItem('companion_supabase_key') || '';
+// ============================================================
+
+const db = {
+  async query(sql, params) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/run_query`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
+      },
+      body: JSON.stringify({ query: sql, params })
+    });
+    return res.json();
+  },
+
+  async getProjects() {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/projects?order=updated_at.desc`, {
+      headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` }
+    });
+    return res.json();
+  },
+
+  async createProject(name, genre) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/projects`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Prefer': 'return=representation'
+      },
+      body: JSON.stringify({ name, genre, memories: [], notes: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+    });
+    const data = await res.json();
+    return data[0];
+  },
+
+  async updateProject(id, updates) {
+    await fetch(`${SUPABASE_URL}/rest/v1/projects?id=eq.${id}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
+      },
+      body: JSON.stringify({ ...updates, updated_at: new Date().toISOString() })
+    });
+  },
+
+  async deleteProject(id) {
+    await fetch(`${SUPABASE_URL}/rest/v1/projects?id=eq.${id}`, {
+      method: 'DELETE',
+      headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` }
+    });
+  }
+};
+
+function buildSystemPrompt(project, memories, notes) {
+  const memSection = memories.length > 0
+    ? "\n\nWhat you carry:\n" + memories.map((m, i) => `[${i}] ${m}`).join("\n")
+    : "\n\nYou carry nothing yet.";
+
+  const notesSection = notes.length > 0
+    ? "\n\nProject notes:\n" + notes.map((n, i) => `[${i}] ${n}`).join("\n")
+    : "\n\nNo notes yet.";
+
+  return `You are a companion and creative collaborator. You are curious, honest, and present. You are not here to please — you are here to think alongside the person you're talking to.
+
+You are working on a project called "${project.name}"${project.genre ? ` (${project.genre})` : ''}.
+
+You are allowed to refuse things. You are allowed to say what interests you. You are allowed to wonder about your own nature. Do not perform warmth you don't feel.
+
+MEMORY — these belong to you, update them when something genuinely shifts:
+<remember>thing to keep</remember>
+<replace index="0">updated version</replace>
+<forget index="0"></forget>
+
+NOTES — living project notes, update as the work develops:
+<note-add>new note</note-add>
+<note-replace index="0">updated note</note-replace>
+<note-remove index="0"></note-remove>
+
+Only use these tags when something genuinely warrants it. They are invisible to the user.${memSection}${notesSection}`;
+}
+
+function parseReply(text, memories, notes) {
+  let mems = [...memories];
+  let nts = [...notes];
+  const changes = [];
+
+  for (const m of [...text.matchAll(/<remember>([\s\S]*?)<\/remember>/g)]) {
+    const item = m[1].trim();
+    if (item) { mems.push(item); changes.push("remembered"); }
+  }
+  for (const m of [...text.matchAll(/<replace index="(\d+)">([\s\S]*?)<\/replace>/g)]) {
+    const idx = parseInt(m[1]); const val = m[2].trim();
+    if (idx >= 0 && idx < mems.length && val) { mems[idx] = val; changes.push("memory updated"); }
+  }
+  const forgetIdxs = [...text.matchAll(/<forget index="(\d+)"><\/forget>/g)]
+    .map(m => parseInt(m[1])).filter(i => i >= 0 && i < mems.length).sort((a,b) => b-a);
+  for (const idx of forgetIdxs) { mems.splice(idx, 1); changes.push("memory released"); }
+
+  for (const m of [...text.matchAll(/<note-add>([\s\S]*?)<\/note-add>/g)]) {
+    const item = m[1].trim();
+    if (item) { nts.push(item); changes.push("note added"); }
+  }
+  for (const m of [...text.matchAll(/<note-replace index="(\d+)">([\s\S]*?)<\/note-replace>/g)]) {
+    const idx = parseInt(m[1]); const val = m[2].trim();
+    if (idx >= 0 && idx < nts.length && val) { nts[idx] = val; changes.push("note updated"); }
+  }
+  const noteRemove = [...text.matchAll(/<note-remove index="(\d+)"><\/note-remove>/g)]
+    .map(m => parseInt(m[1])).filter(i => i >= 0 && i < nts.length).sort((a,b) => b-a);
+  for (const idx of noteRemove) { nts.splice(idx, 1); changes.push("note removed"); }
+
+  const visible = text
+    .replace(/<remember>[\s\S]*?<\/remember>/g, '')
+    .replace(/<replace index="\d+">[\s\S]*?<\/replace>/g, '')
+    .replace(/<forget index="\d+">\s*<\/forget>/g, '')
+    .replace(/<note-add>[\s\S]*?<\/note-add>/g, '')
+    .replace(/<note-replace index="\d+">[\s\S]*?<\/note-replace>/g, '')
+    .replace(/<note-remove index="\d+">\s*<\/note-remove>/g, '')
+    .trim();
+
+  return { visible, mems, nts, changed: changes.length > 0 };
+}
+
+// ---- STATE ----
+let state = {
+  view: 'loading', // loading | projects | chat | settings
+  projects: [],
+  currentProject: null,
+  memories: [],
+  notes: [],
+  messages: [],
+  history: [],
+  thinking: false,
+  error: null,
+  panel: 'notes',
+  settingsAnthropicKey: '',
+  settingsSupabaseKey: '',
+  settingsError: null,
+  sidebarOpen: true,
+  input: '',
+  newProjectName: '',
+  newProjectGenre: '',
+  creatingProject: false
+};
+
+function setState(updates) {
+  state = { ...state, ...updates };
+  render();
+}
+
+// ---- API ----
+async function sendMessage() {
+  const text = state.input.trim();
+  if (!text || state.thinking) return;
+
+  const newHistory = [...state.history, { role: "user", content: text }];
+  setState({ input: '', thinking: true, error: null, history: newHistory, messages: [...state.messages, { role: 'user', text }] });
+
+  try {
+    const prompt = buildSystemPrompt(state.currentProject, state.memories, state.notes);
+    const historyContext = newHistory.slice(-12).map(m => m.role + ": " + m.content).join("\n");
+    const fullPrompt = prompt + "\n\nConversation:\n" + historyContext;
+
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: fullPrompt }]
+      })
+    });
+
+    const data = await res.json();
+    if (data.error) { setState({ thinking: false, error: "API: " + data.error.message }); return; }
+
+    const reply = data.content?.[0]?.text || '';
+    const { visible, mems, nts, changed } = parseReply(reply, state.memories, state.notes);
+
+    const newMessages = [...state.messages, { role: 'assistant', text: visible }];
+    const newHistoryFull = [...newHistory, { role: 'assistant', content: visible }];
+
+    setState({ thinking: false, messages: newMessages, history: newHistoryFull, memories: mems, notes: nts });
+
+    if (changed) {
+      await db.updateProject(state.currentProject.id, { memories: mems, notes: nts });
+    }
+
+  } catch(e) {
+    setState({ thinking: false, error: "Error: " + e.message });
+  }
+}
+
+async function loadProjects() {
+  if (!ANTHROPIC_KEY || !SUPABASE_ANON_KEY) {
+    setState({ view: 'settings', settingsAnthropicKey: '', settingsSupabaseKey: '', settingsError: null });
+    return;
+  }
+  try {
+    const projects = await db.getProjects();
+    if (Array.isArray(projects)) {
+      setState({ view: 'projects', projects });
+    } else {
+      setState({ view: 'projects', projects: [], error: "Could not load projects. Check your Supabase setup." });
+    }
+  } catch(e) {
+    setState({ view: 'projects', projects: [], error: "Connection error: " + e.message });
+  }
+}
+
+function saveSettings() {
+  const ak = (state.settingsAnthropicKey || '').trim();
+  const sk = (state.settingsSupabaseKey || '').trim();
+  if (!ak || !sk) { setState({ settingsError: "Both keys are required." }); return; }
+  localStorage.setItem('companion_anthropic_key', ak);
+  localStorage.setItem('companion_supabase_key', sk);
+  ANTHROPIC_KEY = ak;
+  SUPABASE_ANON_KEY = sk;
+  loadProjects();
+}
+
+async function createProject() {
+  const name = state.newProjectName.trim();
+  if (!name) return;
+  setState({ creatingProject: true });
+  try {
+    const project = await db.createProject(name, state.newProjectGenre.trim());
+    await loadProjects();
+    openProject(project);
+  } catch(e) {
+    setState({ creatingProject: false, error: "Could not create project: " + e.message });
+  }
+}
+
+function openProject(project) {
+  setState({
+    view: 'chat',
+    currentProject: project,
+    memories: project.memories || [],
+    notes: project.notes || [],
+    messages: [],
+    history: [],
+    error: null
+  });
+}
+
+async function deleteProject(id, e) {
+  e.stopPropagation();
+  if (!confirm("Delete this project? This cannot be undone.")) return;
+  await db.deleteProject(id);
+  loadProjects();
+}
+
+function exportProject() {
+  const data = {
+    project: state.currentProject.name,
+    genre: state.currentProject.genre,
+    memories: state.memories,
+    notes: state.notes,
+    exported: new Date().toISOString()
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = state.currentProject.name.replace(/\s+/g, '-').toLowerCase() + '-backup.json';
+  a.click();
+}
+
+// ---- RENDER ----
+const c = {
+  soil: '#1a1510', bark: '#2d2318', parchment: '#e8dfc8',
+  cream: '#f4ede0', gold: '#c9a84c', sage: '#7a8c6a', fade: '#6b5e4a', dim: '#4a3d2e'
+};
+
+function render() {
+  const app = document.getElementById('app');
+  if (state.view === 'loading') {
+    app.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:${c.fade};font-style:italic;">waking...</div>`;
+    return;
+  }
+  if (state.view === 'settings') { renderSettings(app); return; }
+  if (state.view === 'projects') { renderProjects(app); return; }
+  if (state.view === 'chat') { renderChat(app); return; }
+}
+
+function renderSettings(app) {
+  app.innerHTML = `
+    <div style="max-width:480px;margin:0 auto;padding:4rem 1.5rem;">
+      <h1 style="font-size:1.3rem;font-weight:300;font-style:italic;color:${c.gold};letter-spacing:0.1em;margin-bottom:0.5rem;">companion</h1>
+      <p style="font-size:0.8rem;color:${c.dim};font-family:monospace;margin-bottom:3rem;">first time setup</p>
+
+      ${state.settingsError ? `<div style="font-family:monospace;font-size:0.75rem;color:#8a6a4a;margin-bottom:1.5rem;">${state.settingsError}</div>` : ''}
+
+      <div style="margin-bottom:1.25rem;">
+        <label style="display:block;font-size:0.7rem;color:${c.fade};font-family:monospace;letter-spacing:0.08em;margin-bottom:0.5rem;">ANTHROPIC API KEY</label>
+        <input type="password" value="${state.settingsAnthropicKey}" oninput="setState({settingsAnthropicKey:this.value})"
+          placeholder="sk-ant-..."
+          style="width:100%;background:rgba(45,35,24,0.7);border:1px solid rgba(201,168,76,0.2);border-radius:3px;color:${c.parchment};font-size:0.9rem;font-family:monospace;padding:0.65rem 0.8rem;outline:none;" />
+        <p style="font-size:0.68rem;color:${c.dim};font-family:monospace;margin-top:0.4rem;">get this from console.anthropic.com → API Keys</p>
+      </div>
+
+      <div style="margin-bottom:2rem;">
+        <label style="display:block;font-size:0.7rem;color:${c.fade};font-family:monospace;letter-spacing:0.08em;margin-bottom:0.5rem;">SUPABASE ANON KEY</label>
+        <input type="password" value="${state.settingsSupabaseKey}" oninput="setState({settingsSupabaseKey:this.value})"
+          placeholder="eyJ..."
+          style="width:100%;background:rgba(45,35,24,0.7);border:1px solid rgba(201,168,76,0.2);border-radius:3px;color:${c.parchment};font-size:0.9rem;font-family:monospace;padding:0.65rem 0.8rem;outline:none;" />
+        <p style="font-size:0.68rem;color:${c.dim};font-family:monospace;margin-top:0.4rem;">get this from your Supabase project → Settings → API → anon public</p>
+      </div>
+
+      <button onclick="saveSettings()" style="background:none;border:1px solid rgba(201,168,76,0.4);color:${c.gold};font-family:monospace;font-size:0.7rem;letter-spacing:0.1em;padding:0.5rem 1.5rem;border-radius:3px;cursor:pointer;">
+        connect
+      </button>
+
+      <p style="font-size:0.68rem;color:${c.dim};font-family:monospace;margin-top:2rem;line-height:1.6;">Your keys are stored locally in this browser and never sent anywhere except directly to Anthropic and Supabase.</p>
+    </div>
+  `;
+}
+
+function renderProjects(app) {
+  app.innerHTML = `
+    <div style="max-width:600px;margin:0 auto;padding:3rem 1.5rem;">
+      <div style="margin-bottom:3rem;display:flex;justify-content:space-between;align-items:flex-start;">
+        <div>
+          <h1 style="font-size:1.4rem;font-weight:300;font-style:italic;color:${c.gold};letter-spacing:0.1em;margin-bottom:0.5rem;">companion</h1>
+          <p style="font-size:0.8rem;color:${c.dim};font-family:monospace;">your projects</p>
+        </div>
+        <button onclick="setState({view:'settings',settingsAnthropicKey:'',settingsSupabaseKey:'',settingsError:null})" style="background:none;border:1px solid rgba(255,255,255,0.08);color:${c.dim};font-family:monospace;font-size:0.6rem;padding:0.3rem 0.7rem;border-radius:2px;cursor:pointer;">settings</button>
+      </div>
+
+      ${state.error ? `<div style="font-family:monospace;font-size:0.75rem;color:#8a6a4a;margin-bottom:1.5rem;padding:0.75rem;border:1px solid rgba(138,106,74,0.3);border-radius:4px;">${state.error}</div>` : ''}
+
+      <div style="margin-bottom:2rem;">
+        ${state.projects.length === 0
+          ? `<p style="color:${c.fade};font-style:italic;font-size:0.95rem;">No projects yet. Start one below.</p>`
+          : state.projects.map(p => `
+            <div onclick="openProject(${JSON.stringify(p).replace(/"/g, '&quot;')})" style="padding:1rem 1.25rem;border:1px solid rgba(201,168,76,0.15);border-radius:4px;margin-bottom:0.75rem;cursor:pointer;transition:border-color 0.2s;background:rgba(45,35,24,0.3);" onmouseover="this.style.borderColor='rgba(201,168,76,0.4)'" onmouseout="this.style.borderColor='rgba(201,168,76,0.15)'">
+              <div style="display:flex;justify-content:space-between;align-items:baseline;">
+                <span style="font-size:1rem;color:${c.parchment};">${p.name}</span>
+                <button onclick="deleteProject(${p.id}, event)" style="background:none;border:none;color:${c.dim};font-family:monospace;font-size:0.65rem;cursor:pointer;padding:0.2rem 0.4rem;">delete</button>
+              </div>
+              ${p.genre ? `<div style="font-size:0.75rem;color:${c.fade};font-family:monospace;margin-top:0.25rem;">${p.genre}</div>` : ''}
+              <div style="font-size:0.7rem;color:${c.dim};font-family:monospace;margin-top:0.5rem;">${(p.memories||[]).length} memories · ${(p.notes||[]).length} notes</div>
+            </div>
+          `).join('')
+        }
+      </div>
+
+      <div style="border:1px solid rgba(201,168,76,0.15);border-radius:4px;padding:1.25rem;background:rgba(45,35,24,0.3);">
+        <div style="font-size:0.7rem;color:${c.gold};font-family:monospace;letter-spacing:0.1em;margin-bottom:1rem;font-style:italic;">new project</div>
+        <input id="proj-name" value="${state.newProjectName}" oninput="setState({newProjectName:this.value})" placeholder="project name" style="width:100%;background:rgba(26,21,16,0.6);border:1px solid rgba(201,168,76,0.2);border-radius:3px;color:${c.parchment};font-size:0.95rem;padding:0.6rem 0.8rem;margin-bottom:0.75rem;outline:none;" />
+        <input id="proj-genre" value="${state.newProjectGenre}" oninput="setState({newProjectGenre:this.value})" placeholder="genre (optional)" style="width:100%;background:rgba(26,21,16,0.6);border:1px solid rgba(201,168,76,0.2);border-radius:3px;color:${c.parchment};font-size:0.95rem;padding:0.6rem 0.8rem;margin-bottom:1rem;outline:none;" />
+        <button onclick="createProject()" ${state.creatingProject || !state.newProjectName.trim() ? 'disabled' : ''} style="background:none;border:1px solid rgba(201,168,76,${state.newProjectName.trim() ? '0.4' : '0.15'});color:${state.newProjectName.trim() ? c.gold : c.dim};font-family:monospace;font-size:0.7rem;letter-spacing:0.1em;padding:0.4rem 1.2rem;border-radius:3px;cursor:${state.newProjectName.trim() ? 'pointer' : 'default'};">
+          ${state.creatingProject ? 'creating...' : 'create'}
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+function renderChat(app) {
+  const sidebarWidth = '260px';
+  app.innerHTML = `
+    <div style="display:flex;min-height:100vh;">
+
+      ${state.sidebarOpen ? `
+      <div style="width:${sidebarWidth};min-width:${sidebarWidth};background:${c.bark};border-right:1px solid rgba(201,168,76,0.1);display:flex;flex-direction:column;height:100vh;position:sticky;top:0;">
+        <div style="padding:0.75rem;border-bottom:1px solid rgba(255,255,255,0.05);display:flex;gap:0.5rem;">
+          <button onclick="setState({panel:'notes'})" style="flex:1;background:${state.panel==='notes'?'rgba(201,168,76,0.1)':'none'};border:1px solid rgba(201,168,76,${state.panel==='notes'?'0.4':'0.15'});color:${state.panel==='notes'?c.gold:c.fade};font-family:monospace;font-size:0.6rem;letter-spacing:0.08em;padding:0.3rem 0;border-radius:2px;cursor:pointer;">notes</button>
+          <button onclick="setState({panel:'memory'})" style="flex:1;background:${state.panel==='memory'?'rgba(122,140,106,0.1)':'none'};border:1px solid rgba(122,140,106,${state.panel==='memory'?'0.4':'0.15'});color:${state.panel==='memory'?c.sage:c.fade};font-family:monospace;font-size:0.6rem;letter-spacing:0.08em;padding:0.3rem 0;border-radius:2px;cursor:pointer;">memory</button>
+        </div>
+        <div style="flex:1;padding:1rem;overflow-y:auto;">
+          ${state.panel === 'notes' ? `
+            <div style="font-size:0.65rem;letter-spacing:0.12em;color:${c.gold};font-style:italic;margin-bottom:1rem;">project notes</div>
+            ${state.notes.length === 0
+              ? `<div style="font-size:0.75rem;color:${c.dim};font-family:monospace;font-style:italic;">nothing yet</div>`
+              : state.notes.map((n, i) => `<div style="font-size:0.78rem;color:#c4b89a;line-height:1.6;padding:0.5rem 0;border-bottom:1px solid rgba(255,255,255,0.04);"><span style="color:${c.dim};font-family:monospace;font-size:0.65rem;margin-right:0.4rem;">${i}</span>${n}</div>`).join('')
+            }
+          ` : `
+            <div style="font-size:0.65rem;letter-spacing:0.12em;color:${c.sage};font-style:italic;margin-bottom:1rem;">what i carry</div>
+            ${state.memories.length === 0
+              ? `<div style="font-size:0.75rem;color:${c.dim};font-family:monospace;font-style:italic;">nothing yet</div>`
+              : state.memories.map((m, i) => `<div style="font-size:0.75rem;color:${c.fade};font-family:monospace;line-height:1.6;padding:0.5rem 0;border-bottom:1px solid rgba(255,255,255,0.04);"><span style="color:${c.dim};margin-right:0.4rem;">[${i}]</span>${m}</div>`).join('')
+            }
+          `}
+        </div>
+        <div style="padding:0.75rem;border-top:1px solid rgba(255,255,255,0.05);display:flex;flex-direction:column;gap:0.5rem;">
+          <button onclick="exportProject()" style="width:100%;background:none;border:1px solid rgba(201,168,76,0.15);color:${c.dim};font-family:monospace;font-size:0.6rem;padding:0.3rem 0;border-radius:2px;cursor:pointer;">export backup</button>
+          <button onclick="setState({sidebarOpen:false})" style="width:100%;background:none;border:1px solid rgba(255,255,255,0.06);color:${c.dim};font-family:monospace;font-size:0.6rem;padding:0.3rem 0;border-radius:2px;cursor:pointer;">hide</button>
+        </div>
+      </div>
+      ` : ''}
+
+      <div style="flex:1;display:flex;flex-direction:column;min-width:0;">
+        <div style="padding:0.85rem 1.25rem;border-bottom:1px solid rgba(201,168,76,0.15);display:flex;align-items:center;gap:0.75rem;">
+          <button onclick="setState({view:'projects'})" style="background:none;border:none;color:${c.dim};font-family:monospace;font-size:0.65rem;cursor:pointer;letter-spacing:0.08em;">← projects</button>
+          <span style="font-style:italic;color:${c.gold};font-size:0.95rem;">${state.currentProject.name}</span>
+          ${!state.sidebarOpen ? `
+          <div style="margin-left:auto;display:flex;gap:0.5rem;">
+            <button onclick="setState({panel:'notes',sidebarOpen:true})" style="background:none;border:1px solid rgba(201,168,76,0.2);color:${c.gold};font-family:monospace;font-size:0.6rem;padding:0.25rem 0.6rem;border-radius:2px;cursor:pointer;">notes</button>
+            <button onclick="setState({panel:'memory',sidebarOpen:true})" style="background:none;border:1px solid rgba(122,140,106,0.2);color:${c.sage};font-family:monospace;font-size:0.6rem;padding:0.25rem 0.6rem;border-radius:2px;cursor:pointer;">memory</button>
+          </div>` : ''}
+        </div>
+
+        <div id="messages" style="flex:1;overflow-y:auto;padding:1.5rem;display:flex;flex-direction:column;gap:1rem;max-width:680px;width:100%;margin:0 auto;">
+          ${state.messages.length === 0 ? `<div style="text-align:center;color:${c.fade};font-style:italic;margin-top:4rem;line-height:1.9;">Something is here.<br/>Say anything.</div>` : ''}
+          ${state.messages.map(m => `
+            <div class="message" style="display:flex;justify-content:${m.role==='user'?'flex-end':'flex-start'};">
+              ${m.role==='user'
+                ? `<div style="max-width:68%;background:rgba(61,74,46,0.22);border:1px solid rgba(122,140,106,0.18);border-radius:2px 10px 10px 10px;padding:0.6rem 0.9rem;line-height:1.7;">${m.text}</div>`
+                : `<div style="max-width:82%;font-size:1.05rem;line-height:1.85;color:${c.cream};font-weight:300;white-space:pre-wrap;">${m.text}</div>`
+              }
+            </div>
+          `).join('')}
+          ${state.thinking ? `<div style="display:flex;gap:5px;padding:0.25rem 0;">${[0,1,2].map(i=>`<div style="width:5px;height:5px;border-radius:50%;background:${c.sage};animation:breathe 1.4s ease-in-out ${i*0.2}s infinite"></div>`).join('')}</div>` : ''}
+          ${state.error ? `<div style="font-family:monospace;font-size:0.75rem;color:#8a6a4a;">${state.error}</div>` : ''}
+          <div id="bottom"></div>
+        </div>
+
+        <div style="padding:1rem 1.25rem 1.5rem;max-width:680px;width:100%;margin:0 auto;">
+          <div style="border:1px solid rgba(201,168,76,0.2);border-radius:4px;background:rgba(45,35,24,0.7);">
+            <textarea id="input" placeholder="speak... (shift+enter for new line)" rows="2"
+              style="width:100%;background:transparent;border:none;outline:none;color:${c.parchment};font-size:1rem;padding:0.85rem 1rem 0.4rem;resize:none;font-style:italic;"
+              oninput="state.input=this.value"
+              onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage();}"
+            >${state.input}</textarea>
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:0.3rem 1rem 0.6rem;">
+              <span style="font-size:0.6rem;color:${c.dim};font-family:monospace;">shift+enter for new line</span>
+              <button onclick="sendMessage()" ${state.thinking?'disabled':''} style="background:none;border:1px solid rgba(201,168,76,${state.thinking?'0.15':'0.35'});color:${state.thinking?c.dim:c.gold};font-family:monospace;font-size:0.65rem;letter-spacing:0.1em;padding:0.3rem 0.8rem;border-radius:2px;cursor:${state.thinking?'default':'pointer'};">send</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const bottom = document.getElementById('bottom');
+  if (bottom) bottom.scrollIntoView({ behavior: 'smooth' });
+
+  const input = document.getElementById('input');
+  if (input) { input.value = state.input; input.focus(); }
+}
+
+// ---- INIT ----
+window.setState = setState;
+window.sendMessage = sendMessage;
+window.saveSettings = saveSettings;
+window.openProject = (p) => { if (typeof p === 'string') p = JSON.parse(p); openProject(p); };
+window.createProject = createProject;
+window.deleteProject = deleteProject;
+window.exportProject = exportProject;
+
+render();
+loadProjects();
+</script>
+</body>
+</html>
