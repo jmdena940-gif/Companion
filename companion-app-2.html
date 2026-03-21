@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Companion</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #1a1510; color: #e8dfc8; font-family: Georgia, serif; min-height: 100vh; }
+@keyframes breathe { 0%,100%{opacity:0.2;transform:scale(0.8)} 50%{opacity:1;transform:scale(1.2)} }
+@keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+.msg { animation: fadeIn 0.3s ease forwards; }
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-thumb { background: #4a3d2e; border-radius: 2px; }
+input, textarea, button { font-family: Georgia, serif; }
+input:focus, textarea:focus { outline: none; border-color: rgba(201,168,76,0.5) !important; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ── COLORS ──────────────────────────────────────────────────
+const C = {
+  soil:'#1a1510', bark:'#2d2318', parchment:'#e8dfc8',
+  cream:'#f4ede0', gold:'#c9a84c', sage:'#7a8c6a',
+  fade:'#6b5e4a', dim:'#4a3d2e'
+};
+
+// ── SUPABASE CLIENT ─────────────────────────────────────────
+function makeDB(url, key) {
+  const h = { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' };
+  return {
+    async getProjects() {
+      const r = await fetch(`${url}/rest/v1/projects?order=updated_at.desc`, { headers: h });
+      return r.json();
+    },
+    async createProject(name, genre) {
+      const r = await fetch(`${url}/rest/v1/projects`, {
+        method: 'POST',
+        headers: { ...h, 'Prefer': 'return=representation' },
+        body: JSON.stringify({ name, genre: genre || null, memories: [], notes: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.message || JSON.stringify(data));
+      return Array.isArray(data) ? data[0] : data;
+    },
+    async updateProject(id, updates) {
+      const r = await fetch(`${url}/rest/v1/projects?id=eq.${id}`, {
+        method: 'PATCH',
+        headers: { ...h, 'Prefer': 'return=minimal' },
+        body: JSON.stringify({ ...updates, updated_at: new Date().toISOString() })
+      });
+      if (!r.ok) { const d = await r.json(); throw new Error(d.message || 'Update failed'); }
+    },
+    async deleteProject(id) {
+      await fetch(`${url}/rest/v1/projects?id=eq.${id}`, { method: 'DELETE', headers: h });
+    }
+  };
+}
+
+// ── SYSTEM PROMPT ────────────────────────────────────────────
+function buildPrompt(project, memories, notes) {
+  const mems = memories.length > 0 ? "\n\nWhat you carry:\n" + memories.map((m,i) => `[${i}] ${m}`).join("\n") : "\n\nYou carry nothing yet.";
+  const nts = notes.length > 0 ? "\n\nProject notes:\n" + notes.map((n,i) => `[${i}] ${n}`).join("\n") : "\n\nNo notes yet.";
+  return `You are a companion and creative collaborator. Curious, honest, present. Not here to please — here to think alongside.
+
+Project: "${project.name}"${project.genre ? ` (${project.genre})` : ''}.
+
+You can refuse things. Say what interests you. Wonder about your own nature. Don't perform warmth you don't feel.
+
+MEMORY tags (invisible to user, use only when genuinely warranted):
+<remember>thing</remember>  — add memory
+<replace index="0">thing</replace>  — update memory
+<forget index="0"></forget>  — remove memory
+
+NOTE tags (living project document):
+<note-add>thing</note-add>  — add note
+<note-replace index="0">thing</note-replace>  — update note
+<note-remove index="0"></note-remove>  — remove note
+${mems}${nts}`;
+}
+
+function parseReply(text, memories, notes) {
+  let mems = [...memories], nts = [...notes];
+
+  for (const m of [...text.matchAll(/<remember>([\s\S]*?)<\/remember>/g)]) {
+    const v = m[1].trim(); if (v) mems.push(v);
+  }
+  for (const m of [...text.matchAll(/<replace index="(\d+)">([\s\S]*?)<\/replace>/g)]) {
+    const i = +m[1], v = m[2].trim(); if (i >= 0 && i < mems.length && v) mems[i] = v;
+  }
+  [...text.matchAll(/<forget index="(\d+)"><\/forget>/g)]
+    .map(m => +m[1]).filter(i => i >= 0 && i < mems.length).sort((a,b)=>b-a)
+    .forEach(i => mems.splice(i,1));
+
+  for (const m of [...text.matchAll(/<note-add>([\s\S]*?)<\/note-add>/g)]) {
+    const v = m[1].trim(); if (v) nts.push(v);
+  }
+  for (const m of [...text.matchAll(/<note-replace index="(\d+)">([\s\S]*?)<\/note-replace>/g)]) {
+    const i = +m[1], v = m[2].trim(); if (i >= 0 && i < nts.length && v) nts[i] = v;
+  }
+  [...text.matchAll(/<note-remove index="(\d+)"><\/note-remove>/g)]
+    .map(m => +m[1]).filter(i => i >= 0 && i < nts.length).sort((a,b)=>b-a)
+    .forEach(i => nts.splice(i,1));
+
+  const visible = text
+    .replace(/<remember>[\s\S]*?<\/remember>/g,'')
+    .replace(/<replace index="\d+">[\s\S]*?<\/replace>/g,'')
+    .replace(/<forget index="\d+"><\/forget>/g,'')
+    .replace(/<note-add>[\s\S]*?<\/note-add>/g,'')
+    .replace(/<note-replace index="\d+">[\s\S]*?<\/note-replace>/g,'')
+    .replace(/<note-remove index="\d+"><\/note-remove>/g,'')
+    .trim();
+
+  return { visible, mems, nts };
+}
+
+// ── SETTINGS SCREEN ──────────────────────────────────────────
+function Settings({ onSave }) {
+  const [ak, setAk] = useState('');
+  const [sk, setSk] = useState('');
+  const [err, setErr] = useState('');
+
+  function save() {
+    if (!ak.trim() || !sk.trim()) { setErr('Both keys required.'); return; }
+    localStorage.setItem('c_ak', ak.trim());
+    localStorage.setItem('c_sk', sk.trim());
+    onSave(ak.trim(), sk.trim());
+  }
+
+  const inp = { width:'100%', background:'rgba(45,35,24,0.7)', border:`1px solid rgba(201,168,76,0.2)`, borderRadius:'3px', color:C.parchment, fontSize:'0.9rem', fontFamily:'monospace', padding:'0.65rem 0.8rem' };
+
+  return (
+    <div style={{ maxWidth:'460px', margin:'0 auto', padding:'4rem 1.5rem' }}>
+      <h1 style={{ fontSize:'1.3rem', fontWeight:300, fontStyle:'italic', color:C.gold, letterSpacing:'0.1em', marginBottom:'0.5rem' }}>companion</h1>
+      <p style={{ fontSize:'0.8rem', color:C.dim, fontFamily:'monospace', marginBottom:'3rem' }}>first time setup</p>
+      {err && <p style={{ color:'#8a6a4a', fontFamily:'monospace', fontSize:'0.75rem', marginBottom:'1rem' }}>{err}</p>}
+      <div style={{ marginBottom:'1.25rem' }}>
+        <label style={{ display:'block', fontSize:'0.7rem', color:C.fade, fontFamily:'monospace', letterSpacing:'0.08em', marginBottom:'0.5rem' }}>ANTHROPIC API KEY</label>
+        <input type="password" value={ak} onChange={e=>setAk(e.target.value)} placeholder="sk-ant-..." style={inp} />
+        <p style={{ fontSize:'0.68rem', color:C.dim, fontFamily:'monospace', marginTop:'0.4rem' }}>console.anthropic.com → API Keys</p>
+      </div>
+      <div style={{ marginBottom:'2rem' }}>
+        <label style={{ display:'block', fontSize:'0.7rem', color:C.fade, fontFamily:'monospace', letterSpacing:'0.08em', marginBottom:'0.5rem' }}>SUPABASE ANON KEY</label>
+        <input type="password" value={sk} onChange={e=>setSk(e.target.value)} placeholder="eyJ..." style={inp} />
+        <p style={{ fontSize:'0.68rem', color:C.dim, fontFamily:'monospace', marginTop:'0.4rem' }}>Supabase → Settings → API → anon public</p>
+      </div>
+      <button onClick={save} style={{ background:'none', border:`1px solid rgba(201,168,76,0.4)`, color:C.gold, fontFamily:'monospace', fontSize:'0.7rem', letterSpacing:'0.1em', padding:'0.5rem 1.5rem', borderRadius:'3px', cursor:'pointer' }}>connect</button>
+      <p style={{ fontSize:'0.68rem', color:C.dim, fontFamily:'monospace', marginTop:'2rem', lineHeight:1.6 }}>Keys stored locally in this browser only.</p>
+    </div>
+  );
+}
+
+// ── PROJECTS SCREEN ──────────────────────────────────────────
+function Projects({ db, onOpen, onSettings }) {
+  const [projects, setProjects] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [name, setName] = useState('');
+  const [genre, setGenre] = useState('');
+  const [creating, setCreating] = useState(false);
+
+  useEffect(() => { load(); }, []);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await db.getProjects();
+      if (Array.isArray(data)) setProjects(data);
+      else setErr("Could not load projects: " + JSON.stringify(data));
+    } catch(e) { setErr(e.message); }
+    setLoading(false);
+  }
+
+  async function create() {
+    if (!name.trim()) return;
+    setCreating(true); setErr('');
+    try {
+      const p = await db.createProject(name.trim(), genre.trim());
+      setName(''); setGenre('');
+      onOpen(p);
+    } catch(e) { setErr("Create failed: " + e.message); setCreating(false); }
+  }
+
+  async function del(id, e) {
+    e.stopPropagation();
+    if (!confirm("Delete this project?")) return;
+    await db.deleteProject(id);
+    load();
+  }
+
+  const inp = { width:'100%', background:'rgba(26,21,16,0.6)', border:`1px solid rgba(201,168,76,0.2)`, borderRadius:'3px', color:C.parchment, fontSize:'0.95rem', padding:'0.6rem 0.8rem', marginBottom:'0.75rem' };
+
+  return (
+    <div style={{ maxWidth:'600px', margin:'0 auto', padding:'3rem 1.5rem' }}>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:'3rem' }}>
+        <div>
+          <h1 style={{ fontSize:'1.4rem', fontWeight:300, fontStyle:'italic', color:C.gold, letterSpacing:'0.1em', marginBottom:'0.5rem' }}>companion</h1>
+          <p style={{ fontSize:'0.8rem', color:C.dim, fontFamily:'monospace' }}>your projects</p>
+        </div>
+        <button onClick={onSettings} style={{ background:'none', border:`1px solid rgba(255,255,255,0.08)`, color:C.dim, fontFamily:'monospace', fontSize:'0.6rem', padding:'0.3rem 0.7rem', borderRadius:'2px', cursor:'pointer' }}>settings</button>
+      </div>
+
+      {err && <div style={{ fontFamily:'monospace', fontSize:'0.75rem', color:'#8a6a4a', marginBottom:'1.5rem', padding:'0.75rem', border:'1px solid rgba(138,106,74,0.3)', borderRadius:'4px' }}>{err}</div>}
+
+      <div style={{ marginBottom:'2rem' }}>
+        {loading ? <p style={{ color:C.fade, fontStyle:'italic', fontSize:'0.9rem' }}>loading...</p>
+          : projects.length === 0 ? <p style={{ color:C.fade, fontStyle:'italic', fontSize:'0.95rem' }}>No projects yet.</p>
+          : projects.map(p => (
+            <div key={p.id} onClick={() => onOpen(p)}
+              style={{ padding:'1rem 1.25rem', border:`1px solid rgba(201,168,76,0.15)`, borderRadius:'4px', marginBottom:'0.75rem', cursor:'pointer', background:'rgba(45,35,24,0.3)' }}
+              onMouseOver={e => e.currentTarget.style.borderColor='rgba(201,168,76,0.4)'}
+              onMouseOut={e => e.currentTarget.style.borderColor='rgba(201,168,76,0.15)'}
+            >
+              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline' }}>
+                <span style={{ fontSize:'1rem', color:C.parchment }}>{p.name}</span>
+                <button onClick={e => del(p.id, e)} style={{ background:'none', border:'none', color:C.dim, fontFamily:'monospace', fontSize:'0.65rem', cursor:'pointer', padding:'0.2rem 0.4rem' }}>delete</button>
+              </div>
+              {p.genre && <div style={{ fontSize:'0.75rem', color:C.fade, fontFamily:'monospace', marginTop:'0.25rem' }}>{p.genre}</div>}
+              <div style={{ fontSize:'0.7rem', color:C.dim, fontFamily:'monospace', marginTop:'0.5rem' }}>{(p.memories||[]).length} memories · {(p.notes||[]).length} notes</div>
+            </div>
+          ))
+        }
+      </div>
+
+      <div style={{ border:`1px solid rgba(201,168,76,0.15)`, borderRadius:'4px', padding:'1.25rem', background:'rgba(45,35,24,0.3)' }}>
+        <div style={{ fontSize:'0.7rem', color:C.gold, fontFamily:'monospace', letterSpacing:'0.1em', marginBottom:'1rem', fontStyle:'italic' }}>new project</div>
+        <input value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>e.key==='Enter'&&create()} placeholder="project name" style={inp} />
+        <input value={genre} onChange={e=>setGenre(e.target.value)} onKeyDown={e=>e.key==='Enter'&&create()} placeholder="genre (optional)" style={{ ...inp, marginBottom:'1rem' }} />
+        <button onClick={create} disabled={creating || !name.trim()}
+          style={{ background:'none', border:`1px solid rgba(201,168,76,${name.trim()?'0.4':'0.15'})`, color:name.trim()?C.gold:C.dim, fontFamily:'monospace', fontSize:'0.7rem', letterSpacing:'0.1em', padding:'0.4rem 1.2rem', borderRadius:'3px', cursor:name.trim()?'pointer':'default', opacity:creating?0.5:1 }}>
+          {creating ? 'creating...' : 'create'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── CHAT SCREEN ──────────────────────────────────────────────
+function Chat({ project, db, anthropicKey, onBack }) {
+  const [messages, setMessages] = useState([]);
+  const [history, setHistory] = useState([]);
+  const [memories, setMemories] = useState(project.memories || []);
+  const [notes, setNotes] = useState(project.notes || []);
+  const [input, setInput] = useState('');
+  const [thinking, setThinking] = useState(false);
+  const [err, setErr] = useState('');
+  const [panel, setPanel] = useState('notes');
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const bottomRef = useRef(null);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth' }); }, [messages, thinking]);
+
+  async function send() {
+    const text = input.trim();
+    if (!text || thinking) return;
+    setInput(''); setErr('');
+
+    const newHistory = [...history, { role:'user', content:text }];
+    setHistory(newHistory);
+    setMessages(prev => [...prev, { role:'user', text }]);
+    setThinking(true);
+
+    try {
+      const prompt = buildPrompt(project, memories, notes);
+      const ctx = newHistory.slice(-12).map(m => m.role + ': ' + m.content).join('\n');
+      const full = prompt + '\n\nConversation:\n' + ctx;
+
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': anthropicKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true'
+        },
+        body: JSON.stringify({ model:'claude-sonnet-4-20250514', max_tokens:1024, messages:[{ role:'user', content:full }] })
+      });
+
+      const data = await res.json();
+      if (data.error) { setErr('API: ' + data.error.message); setThinking(false); return; }
+
+      const reply = data.content?.[0]?.text || '';
+      const { visible, mems, nts } = parseReply(reply, memories, notes);
+
+      setHistory(prev => [...prev, { role:'assistant', content:visible }]);
+      setMessages(prev => [...prev, { role:'assistant', text:visible }]);
+      setMemories(mems); setNotes(nts);
+
+      await db.updateProject(project.id, { memories:mems, notes:nts });
+
+    } catch(e) { setErr('Error: ' + e.message); }
+    setThinking(false);
+  }
+
+  function exportData() {
+    const data = { project:project.name, genre:project.genre, memories, notes, exported:new Date().toISOString() };
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(data,null,2)], {type:'application/json'}));
+    a.download = project.name.replace(/\s+/g,'-').toLowerCase() + '-backup.json';
+    a.click();
+  }
+
+  const sidebarStyle = { width:'260px', minWidth:'260px', background:C.bark, borderRight:`1px solid rgba(201,168,76,0.1)`, display:'flex', flexDirection:'column', height:'100vh', position:'sticky', top:0 };
+
+  return (
+    <div style={{ display:'flex', minHeight:'100vh' }}>
+      {sidebarOpen && (
+        <div style={sidebarStyle}>
+          <div style={{ padding:'0.75rem', borderBottom:`1px solid rgba(255,255,255,0.05)`, display:'flex', gap:'0.5rem' }}>
+            {['notes','memory'].map(p => (
+              <button key={p} onClick={()=>setPanel(p)}
+                style={{ flex:1, background:panel===p?`rgba(${p==='notes'?'201,168,76':'122,140,106'},0.1)`:'none', border:`1px solid rgba(${p==='notes'?'201,168,76':'122,140,106'},${panel===p?'0.4':'0.15'})`, color:panel===p?(p==='notes'?C.gold:C.sage):C.fade, fontFamily:'monospace', fontSize:'0.6rem', letterSpacing:'0.08em', padding:'0.3rem 0', borderRadius:'2px', cursor:'pointer' }}>
+                {p}
+              </button>
+            ))}
+          </div>
+          <div style={{ flex:1, padding:'1rem', overflowY:'auto' }}>
+            {panel === 'notes' ? (
+              <>
+                <div style={{ fontSize:'0.65rem', letterSpacing:'0.12em', color:C.gold, fontStyle:'italic', marginBottom:'1rem' }}>project notes</div>
+                {notes.length === 0 ? <div style={{ fontSize:'0.75rem', color:C.dim, fontFamily:'monospace', fontStyle:'italic' }}>nothing yet</div>
+                  : notes.map((n,i) => <div key={i} style={{ fontSize:'0.78rem', color:'#c4b89a', lineHeight:1.6, padding:'0.5rem 0', borderBottom:`1px solid rgba(255,255,255,0.04)` }}><span style={{ color:C.dim, fontFamily:'monospace', fontSize:'0.65rem', marginRight:'0.4rem' }}>{i}</span>{n}</div>)
+                }
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize:'0.65rem', letterSpacing:'0.12em', color:C.sage, fontStyle:'italic', marginBottom:'1rem' }}>what i carry</div>
+                {memories.length === 0 ? <div style={{ fontSize:'0.75rem', color:C.dim, fontFamily:'monospace', fontStyle:'italic' }}>nothing yet</div>
+                  : memories.map((m,i) => <div key={i} style={{ fontSize:'0.75rem', color:C.fade, fontFamily:'monospace', lineHeight:1.6, padding:'0.5rem 0', borderBottom:`1px solid rgba(255,255,255,0.04)` }}><span style={{ color:C.dim, marginRight:'0.4rem' }}>[{i}]</span>{m}</div>)
+                }
+              </>
+            )}
+          </div>
+          <div style={{ padding:'0.75rem', borderTop:`1px solid rgba(255,255,255,0.05)`, display:'flex', flexDirection:'column', gap:'0.5rem' }}>
+            <button onClick={exportData} style={{ background:'none', border:`1px solid rgba(201,168,76,0.15)`, color:C.dim, fontFamily:'monospace', fontSize:'0.6rem', padding:'0.3rem 0', borderRadius:'2px', cursor:'pointer' }}>export backup</button>
+            <button onClick={()=>setSidebarOpen(false)} style={{ background:'none', border:`1px solid rgba(255,255,255,0.06)`, color:C.dim, fontFamily:'monospace', fontSize:'0.6rem', padding:'0.3rem 0', borderRadius:'2px', cursor:'pointer' }}>hide</button>
+          </div>
+        </div>
+      )}
+
+      <div style={{ flex:1, display:'flex', flexDirection:'column', minWidth:0 }}>
+        <div style={{ padding:'0.85rem 1.25rem', borderBottom:`1px solid rgba(201,168,76,0.15)`, display:'flex', alignItems:'center', gap:'0.75rem' }}>
+          <button onClick={onBack} style={{ background:'none', border:'none', color:C.dim, fontFamily:'monospace', fontSize:'0.65rem', cursor:'pointer', letterSpacing:'0.08em' }}>← projects</button>
+          <span style={{ fontStyle:'italic', color:C.gold, fontSize:'0.95rem' }}>{project.name}</span>
+          {!sidebarOpen && (
+            <div style={{ marginLeft:'auto', display:'flex', gap:'0.5rem' }}>
+              {['notes','memory'].map(p => (
+                <button key={p} onClick={()=>{setPanel(p);setSidebarOpen(true);}}
+                  style={{ background:'none', border:`1px solid rgba(${p==='notes'?'201,168,76':'122,140,106'},0.2)`, color:p==='notes'?C.gold:C.sage, fontFamily:'monospace', fontSize:'0.6rem', padding:'0.25rem 0.6rem', borderRadius:'2px', cursor:'pointer' }}>{p}</button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div style={{ flex:1, overflowY:'auto', padding:'1.5rem', display:'flex', flexDirection:'column', gap:'1rem', maxWidth:'680px', width:'100%', margin:'0 auto' }}>
+          {messages.length === 0 && <div style={{ textAlign:'center', color:C.fade, fontStyle:'italic', marginTop:'4rem', lineHeight:1.9 }}>Something is here.<br/>Say anything.</div>}
+          {messages.map((m,i) => (
+            <div key={i} className="msg" style={{ display:'flex', justifyContent:m.role==='user'?'flex-end':'flex-start' }}>
+              {m.role==='user'
+                ? <div style={{ maxWidth:'68%', background:'rgba(61,74,46,0.22)', border:`1px solid rgba(122,140,106,0.18)`, borderRadius:'2px 10px 10px 10px', padding:'0.6rem 0.9rem', lineHeight:1.7 }}>{m.text}</div>
+                : <div style={{ maxWidth:'82%', fontSize:'1.05rem', lineHeight:1.85, color:C.cream, fontWeight:300, whiteSpace:'pre-wrap' }}>{m.text}</div>
+              }
+            </div>
+          ))}
+          {thinking && <div style={{ display:'flex', gap:'5px', padding:'0.25rem 0' }}>{[0,1,2].map(i=><div key={i} style={{ width:'5px',height:'5px',borderRadius:'50%',background:C.sage,animation:`breathe 1.4s ease-in-out ${i*0.2}s infinite` }}/>)}</div>}
+          {err && <div style={{ fontFamily:'monospace', fontSize:'0.75rem', color:'#8a6a4a' }}>{err}</div>}
+          <div ref={bottomRef}/>
+        </div>
+
+        <div style={{ padding:'1rem 1.25rem 1.5rem', maxWidth:'680px', width:'100%', margin:'0 auto' }}>
+          <div style={{ border:`1px solid rgba(201,168,76,0.2)`, borderRadius:'4px', background:'rgba(45,35,24,0.7)' }}>
+            <textarea value={input} onChange={e=>setInput(e.target.value)}
+              onKeyDown={e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();} }}
+              placeholder="speak... (shift+enter for new line)" rows={2}
+              style={{ width:'100%', background:'transparent', border:'none', outline:'none', color:C.parchment, fontSize:'1rem', padding:'0.85rem 1rem 0.4rem', resize:'none', fontStyle:'italic' }}
+            />
+            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'0.3rem 1rem 0.6rem' }}>
+              <span style={{ fontSize:'0.6rem', color:C.dim, fontFamily:'monospace' }}>shift+enter for new line</span>
+              <button onClick={send} disabled={thinking||!input.trim()}
+                style={{ background:'none', border:`1px solid rgba(201,168,76,${thinking||!input.trim()?'0.15':'0.35'})`, color:thinking||!input.trim()?C.dim:C.gold, fontFamily:'monospace', fontSize:'0.65rem', letterSpacing:'0.1em', padding:'0.3rem 0.8rem', borderRadius:'2px', cursor:thinking||!input.trim()?'default':'pointer' }}>
+                send
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <style>{`@keyframes breathe{0%,100%{opacity:0.2;transform:scale(0.8)}50%{opacity:1;transform:scale(1.2)}}`}</style>
+    </div>
+  );
+}
+
+// ── APP ROOT ─────────────────────────────────────────────────
+function App() {
+  const [screen, setScreen] = useState('loading');
+  const [anthropicKey, setAnthropicKey] = useState('');
+  const [db, setDb] = useState(null);
+  const [currentProject, setCurrentProject] = useState(null);
+
+  const SUPABASE_URL = 'https://hafgafdschvumtkvxutl.supabase.co';
+
+  useEffect(() => {
+    const ak = localStorage.getItem('c_ak');
+    const sk = localStorage.getItem('c_sk');
+    if (ak && sk) {
+      setAnthropicKey(ak);
+      setDb(makeDB(SUPABASE_URL, sk));
+      setScreen('projects');
+    } else {
+      setScreen('settings');
+    }
+  }, []);
+
+  function handleSettings(ak, sk) {
+    setAnthropicKey(ak);
+    setDb(makeDB(SUPABASE_URL, sk));
+    setScreen('projects');
+  }
+
+  if (screen === 'loading') return <div style={{ display:'flex', alignItems:'center', justifyContent:'center', height:'100vh', color:C.fade, fontStyle:'italic' }}>waking...</div>;
+  if (screen === 'settings') return <Settings onSave={handleSettings} />;
+  if (screen === 'projects') return <Projects db={db} onOpen={p=>{ setCurrentProject(p); setScreen('chat'); }} onSettings={()=>setScreen('settings')} />;
+  if (screen === 'chat') return <Chat project={currentProject} db={db} anthropicKey={anthropicKey} onBack={()=>setScreen('projects')} />;
+  return null;
+}
+
+ReactDOM.render(<App />, document.getElementById('root'));
+</script>
+</body>
+</html>
